@@ -9,6 +9,7 @@
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <fcntl.h>
+#include <string>
 
 // 定义服务器响应状态信息
 const char* ok_200_title = "OK";
@@ -41,18 +42,24 @@ public:
             return epollfd;
         }
 
-        static bool Addevent(int epfd, int sockfd, uint32_t event)
+        // Addevent默认有EPOLLIN | EPOLLET | EPOLLRDHUP;
+        static bool Addevent(int epfd, int sockfd, bool one_shot)
         {
             struct epoll_event ev;
-            ev.events = event;
+            ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
             ev.data.fd = sockfd;
+            if(one_shot)
+            {
+                ev.events |= EPOLLONESHOT;
+            }
+
             return epoll_ctl(epfd, EPOLL_CTL_ADD, sockfd, &ev) == 0;
         }
 
         static bool Modevent(int epfd, int sockfd, uint32_t event)
         {
             struct epoll_event ev;
-            ev.events = event;
+            ev.events = event | EPOLLET | EPOLLRDHUP | EPOLLONESHOT;
             ev.data.fd = sockfd;
             return epoll_ctl(epfd, EPOLL_CTL_MOD, sockfd, &ev) == 0;
         }
