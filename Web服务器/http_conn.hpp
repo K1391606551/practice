@@ -1,6 +1,7 @@
 #pragma once
 #include "util.hpp"
 #include <cstring>
+#include <cstdarg>
 #include <unordered_map>
 #include <unistd.h>
 #include <string>
@@ -29,13 +30,22 @@ public:
         OPTIONS,
         PATCH
     };
-    // 解析客户请求时，主状态机所处的状态
+    // 主状态机所处的状态，分别表示在解析客户请求时所处的状态
     enum CHECK_STATE
     {
         CHECK_STATE_REQUESTLINE = 0,
-        CHECK_STAT_HEADER,
+        CHECK_STATE_HEADER,
         CHECK_STATE_CONTENT
     };
+
+    // 从状态机所处的状态，分别表示在解析客户请求 行 的读取状态
+    enum LINE_STATUS
+    {
+        LINE_OK = 0, /*读取到一个完整的行*/
+        LINE_BAD,    /*行读取出错*/
+        LINE_OPEN    /*行数据尚不完整*/
+    };
+
     // 服务器处理HTTP请求的可能结果，状态码
     enum HTTP_CODE
     {
@@ -44,16 +54,9 @@ public:
         BAD_REQUEST /*用户请求出现了语法错误*/,
         NO_RESOURCE /*用户请求的资源不从在*/,
         FORBIDDEN_REQUEST /*用户对请求的资源没有访问权限*/,
-        FILE_REQUEST /**/,
+        FILE_REQUEST /*对于请求已经获取到请求资源的文件*/,
         INTERNAL_ERROR,   /*服务器内部报错*/
         CLOSED_CONNECTION /*客户端已经关闭连接*/
-    };
-    // 行的读取状态
-    enum LINE_STATUS
-    {
-        LINE_OK = 0,
-        LINE_BAD,
-        LINE_OPEN
     };
 
 public:
@@ -68,7 +71,7 @@ public:
         // 下面两行是为了避免TIME_WAIT状态，仅适用与调试，实际使用时应该去掉
         int op = 1;
         setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &op, sizeof(op));
-        
+
         Util::Epoll::Addevent(_epollfd, sockfd, true);
         int old_option = Util::SetNonBlock::setnonblock(sockfd);
         _user_count++;
@@ -87,9 +90,26 @@ public:
         }
     }
     // 处理客户请求
+    // 由线程池中的工作线程调用，这是处理HTTP请求的入口函数
     void handel()
     {
+        HTTP_CODE read_ret = handel_read();
+        if (read_ret == NO_REQUEST)
+        {
+            Util::Epoll::Modevent(_epollfd, _sockfd, EPOLLIN);
+            return;
+        }
+
+        bool write_ret = handel_write(read_ret);
+
+        Util::Epoll::Modevent(_epollfd, _sockfd, EPOLLOUT);
+        // 出错了
+        if (!write_ret)
+        {
+            close_conn();
+        }
     }
+
     // 非阻塞读
     bool read()
     {
@@ -139,19 +159,50 @@ public:
         int bytes_have_send = 0;
         // 还有多少字节没有发送
         int bytes_to_send = _write_index;
-        if(bytes_to_send == 0)
+        if (bytes_to_send == 0)
         {
             Util::Epoll::Modevent(_epollfd, _sockfd, EPOLLIN);
             init();
             return true;
         }
 
-        while(true)
+        while (true)
         {
             temp = writev(_sockfd, _iv, _iv_count);
-            if(temp <= -1)
+            if (temp <= -1)
             {
-                
+                if (temp <= -1)
+                {
+                    // 如果TCP写缓冲区没有空间，则等待下一轮EPOLLOUT事件。索然在此期间，
+                    // 服务器无法立即接收到同一客户的下一个请求，但可以保证连接的完整性
+                    if (errno == EAGAIN)
+                    {
+                        Util::Epoll::Modevent(_epollfd, _sockfd, EPOLLOUT);
+                        return true;
+                    }
+
+                    unmap();
+                    return false;
+                }
+            }
+
+            bytes_to_send -= temp;
+            bytes_have_send += temp;
+            if (bytes_to_send <= bytes_have_send)
+            {
+                // 发送HTTP响应成功，根据HTTP请求中的Connection字段决定是否要断开连接
+                unmap();
+                if (_linger)
+                {
+                    init();
+                    Util::Epoll::Modevent(_epollfd, _sockfd, EPOLLIN);
+                    return true;
+                }
+                else
+                {
+                    Util::Epoll::Modevent(_epollfd, _sockfd, EPOLLIN);
+                    return false;
+                }
             }
         }
     }
@@ -175,6 +226,7 @@ private:
         memset(_write_buffer, '\0', WRITE_BUFFER_SIZE);
         memset(_real_file, '\0', FILENAME_LEN);
     }
+
     // 解析HTTP请求 主状态机
     HTTP_CODE handel_read()
     {
@@ -189,87 +241,180 @@ private:
             std::cout << "get a http line: " << text << std::endl;
             switch (_check_state)
             {
-                // 第一个状态，分析请求行
-                case CHECK_STATE_REQUESTLINE:
+            // 第一个状态，分析请求行
+            case CHECK_STATE_REQUESTLINE:
+            {
+                ret = parse_request_line(text);
+                if (ret == BAD_REQUEST)
                 {
-                    ret = parse_request_line(text);
-                    if(ret == BAD_REQUEST)
-                    {
-                        return BAD_REQUEST;
-                    }
-                    break;
+                    return BAD_REQUEST;
                 }
-                // 第二个状态，分析请求报头字段
-                case CHECK_STAT_HEADER:
+                break;
+            }
+            // 第二个状态，分析请求报头字段
+            case CHECK_STATE_HEADER:
+            {
+                ret = parse_request_headers(text);
+                if (ret == BAD_REQUEST)
                 {
-                    ret = parse_request_headers(text);
-                    if(ret == BAD_REQUEST)
-                    {
-                        return BAD_REQUEST;
-                    }
-                    else if(ret == GET_REQUEST)
-                    {
-                        return do_request();
-                    }
-                    break;
+                    return BAD_REQUEST;
                 }
-                // 第三个状态，分析请求正文字段
-                case CHECK_STATE_CONTENT:
+                else if (ret == GET_REQUEST)
                 {
-                    ret = parse_request_content(text);
-                    if(ret == GET_REQUEST)
-                    {
-                        return do_request();
-                    }
-                    line_status = LINE_OPEN;
-                    break;
+                    return do_request();
                 }
-                default:
+                break;
+            }
+            // 第三个状态，分析请求正文字段
+            case CHECK_STATE_CONTENT:
+            {
+                ret = parse_request_content(text);
+                if (ret == GET_REQUEST)
                 {
-                    return INTERNAL_ERROR;
+                    return do_request();
                 }
+                line_status = LINE_OPEN;
+                break;
+            }
+            default:
+            {
+                return INTERNAL_ERROR;
+            }
             }
         }
 
         return NO_REQUEST;
     }
+
     // 填充HTTP应答
+    // 根据服务器处理HTTP请求的结果，决定返回给客户端的内容
     bool handel_write(HTTP_CODE ret)
     {
+        switch (ret)
+        {
+        case INTERNAL_ERROR:
+        {
+            add_status_line(500, error_500_title);
+            add_headers(strlen(error_500_form));
+            if (!add_content(error_500_form))
+            {
+                return false;
+            }
+            break;
+        }
+        case BAD_REQUEST:
+        {
+            add_status_line(400, error_400_title);
+            add_headers(strlen(error_400_form));
+            if (!add_content(error_400_form))
+            {
+                return false;
+            }
+            break;
+        }
+        case NO_RESOURCE:
+        {
+            add_status_line(404, error_404_title);
+            add_headers(strlen(error_404_form));
+            if (!add_content(error_400_form))
+            {
+                return false;
+            }
+            break;
+        }
+        case FORBIDDEN_REQUEST:
+        {
+            add_status_line(403, error_403_title);
+            add_headers(strlen(error_403_form));
+            if (!add_content(error_403_form))
+            {
+                return false;
+            }
+            break;
+        }
+        case FILE_REQUEST:
+        {
+            add_status_line(200, ok_200_title);
+            // 下面代码不理解
+            if (_file_stat.st_size != 0)
+            {
+                add_headers(_file_stat.st_size);
+                _iv[0].iov_base = _write_buffer;
+                _iv[0].iov_len = _write_index;
+                _iv[1].iov_base = _file_address;
+                _iv[1].iov_len = _file_stat.st_size;
+                _iv_count = 2;
+                return true;
+            }
+            else
+            {
+                const char *ok_string = "<html><body></body><html></html>";
+                add_headers(strlen(ok_string));
+                if (!add_content(ok_string))
+                {
+                    return false;
+                }
+            }
+        }
+        default:
+        {
+            return false;
+        }
+        }
+
+        _iv[0].iov_base = _write_buffer;
+        _iv[0].iov_len = _write_index;
+        _iv_count = 1;
+        return true;
     }
 
 private:
     // 这一组函数用于被handel_read调用分析HTTP请求
     HTTP_CODE parse_request_line(char *text)
     {
-        // int pos1 = text.find(' ');
-        // int pos2 = text.rfind(' ');
-        // if (pos1 == pos2)
-        // {
-        //     return BAD_REQUEST;
-        // }
-        // _url = text.substr(pos1 + 1, pos2);
-        // if (_url.find("http://") == std::string::npos)
-        // {
-        //     return BAD_REQUEST;
-        // }
-        // std::string method = text.substr(0, pos1);
-        // if (method == "GET")
-        // {
-        //     _method = GET;
-        // }
-        // // 我们这里只支持GET
-        // else
-        // {
-        //     return BAD_REQUEST;
-        // }
-        // _version = text.substr(pos2 + 1);
-        // if (_version != "HTTP/1.1" && _version != "HTTP/1.0")
-        // {
-        //     return BAD_REQUEST;
-        // }
-        // _check_state = CHECK_STATE_STATE_HEADER;
-        // return NO_REQUEST;
+        _url = strpbrk(text, " ");
+        if (!_url)
+        {
+            return BAD_REQUEST;
+        }
+        *_url++ = '\0';
+
+        char *method = text;
+        // 感觉有问题
+        if (strcasecmp(method, "GET") == 0)
+        {
+            _method = GET;
+        }
+        else
+        {
+            return BAD_REQUEST;
+        }
+
+        _url += strspn(_url, " ");
+        _version = strpbrk(_url, " ");
+        if (!_version)
+        {
+            return BAD_REQUEST;
+        }
+        *_version++ = '\0';
+        _version += strspn(_version, " ");
+        if (strcasecmp(_version, "HTTP/1.1") != 0)
+        {
+            return BAD_REQUEST;
+        }
+        if (strncasecmp(_url, "http://", 7) == 0)
+        {
+            _url += 7;
+            _url = strchr(_url, '/');
+        }
+
+        if (!_url || _url[0] != '/')
+        {
+            return BAD_REQUEST;
+        }
+
+        _check_state = CHECK_STATE_HEADER;
+        return NO_REQUEST;
     }
 
     HTTP_CODE parse_request_headers(char *text)
@@ -340,19 +485,19 @@ private:
         strcpy(_real_file, doc_root);
         int len = strlen(doc_root);
         /*文件最大为FILENAME_LEN,已经拷贝进去len了，所有做多还可以拷贝FILENAME_LEN - len，留下一个字符肯有用*/
-        strncpy(_real_file + len, _url, FILENAME_LEN - len - 1 );
+        strncpy(_real_file + len, _url, FILENAME_LEN - len - 1);
         // 下去查看stat系统函数的作用
-        if(stat(_real_file, &_file_stat) < 0)
+        if (stat(_real_file, &_file_stat) < 0)
         {
             return NO_REQUEST;
         }
-        
-        if(!(_file_stat.st_mode & S_IROTH))
+
+        if (!(_file_stat.st_mode & S_IROTH))
         {
             return FORBIDDEN_REQUEST;
         }
 
-        if(S_ISDIR(_file_stat.st_mode))
+        if (S_ISDIR(_file_stat.st_mode))
         {
             return BAD_REQUEST;
         }
@@ -360,8 +505,8 @@ private:
         int fd = open(_real_file, O_RDONLY);
         _file_address = (char *)mmap(0, _file_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
         close(fd);
-        
-        return FILE_REQUEST;   
+
+        return FILE_REQUEST;
     }
     char *get_line()
     {
@@ -419,33 +564,60 @@ private:
     // 对内存映射区执行munmap操作
     void unmap()
     {
-        if(_file_address)
+        if (_file_address)
         {
             munmap(_file_address, _file_stat.st_size);
             _file_address = 0;
         }
     }
 
+    // 往写缓冲区中写入待发送数据
     bool add_response(const char *format, ...)
     {
+        if (_write_index >= WRITE_BUFFER_SIZE)
+        {
+            return false;
+        }
+
+        va_list arg_list;
+        va_start(arg_list, format);
+        int len = vsnprintf(_write_buffer + _write_index, WRITE_BUFFER_SIZE - 1 - _write_index, format, arg_list);
+        if (len >= (WRITE_BUFFER_SIZE - 1 - _write_index))
+        {
+            return false;
+        }
+
+        _write_index += len;
+        va_end(arg_list);
+        return true;
     }
+
     bool add_content(const char *content)
     {
+        return add_response("s", content);
     }
+
     bool add_status_line(int status, const char *title)
     {
+        return add_response("%s %d %s\r\n", "http/1.1", status, title);
     }
     bool add_headers(int content_length)
     {
+        add_content_length(content_length);
+        add_linger();
+        add_blank_line();
     }
-    bool add_content_length(int content_legth)
+    bool add_content_length(int content_length)
     {
+        return add_response("Content-Length: %d\r\t", content_length);
     }
     bool add_linger()
     {
+        return add_response("Connection: %s\r\t", (_linger == true) ? "keep-alive" : "close");
     }
     bool add_blank_line()
     {
+        return add_response("%s", "\r\n");
     }
 
 public:
@@ -479,11 +651,11 @@ private:
     // 客户请求的目标文件的完整路径，其内容等于doc_root + _url,doc_root是网站根目录
     char _real_file[FILENAME_LEN];
     // 客户请求的目标文件的文件名
-    char* _url;
+    char *_url;
     // HTTP版本协议号 仅支持HTTP/1.1
-    char* _version;
+    char *_version;
     // 主机名
-    char* _host;
+    char *_host;
     // HTTP请求的消息体长度
     int _content_length;
     // HTTP请求是否要保持连接
