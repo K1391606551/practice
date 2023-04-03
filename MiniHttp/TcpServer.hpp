@@ -7,7 +7,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pthread.h>
-
+#include "Util.hpp"
 #define BACKLOG 5
 
 class TcpServer
@@ -23,6 +23,7 @@ public:
             if (_instance == nullptr)
             {
                 _instance = new TcpServer(port);
+                _instance->InitServer();
             }
             // 解锁
             pthread_mutex_unlock(&_mutex);
@@ -33,6 +34,11 @@ public:
 
     ~TcpServer()
     {
+        if(_listensock >= 0)
+        {
+            close(_listensock);
+            Util::logMessage(INFO, "filename : %s | line : %d | %s", __FILE__, __LINE__, "close listen sockfd success!");
+        }
     }
 
 public:
@@ -41,6 +47,7 @@ public:
         Socket();
         Bind();
         Listen();
+        Util::logMessage(INFO, "filename : %s | line : %d | %s", __FILE__, __LINE__, "tcpserver initializer success!");
     }
 
     int Accept(struct sockaddr_in *peer, socklen_t *len)
@@ -64,8 +71,14 @@ private:
         if (_listensock < 0)
         {
             // 打印日志
+            Util::logMessage(FATAL, "filename : %s | line : %d | %s", __FILE__, __LINE__, "create socket error!");
             exit(1);
         }
+
+        int opt = 1;
+        // 防止服务器因为异常主动断开的timewait状态
+        setsockopt(_listensock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
+        Util::logMessage(INFO, "filename : %s | line : %d | %s", __FILE__, __LINE__, "create socket success!");
     }
 
     void Bind()
@@ -80,8 +93,10 @@ private:
         if (ret < 0)
         {
             // 打印日志
+            Util::logMessage(FATAL, "filename : %s | line : %d | %s", __FILE__, __LINE__, "bind socket error!");
             exit(2);
         }
+        Util::logMessage(INFO, "filename : %s | line : %d | %s", __FILE__, __LINE__, "bind socket success!");
     }
 
     void Listen()
@@ -90,8 +105,10 @@ private:
         if (ret < 0)
         {
             // 打印日志
+            Util::logMessage(FATAL, "filename : %s | line : %d | %s", __FILE__, __LINE__, "listen socket error!");
             exit(3);
         }
+        Util::logMessage(INFO, "filename : %s | line : %d | %s", __FILE__, __LINE__, "listen socket success!");
     }
 
 private:

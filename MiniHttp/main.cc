@@ -1,6 +1,7 @@
 #include <iostream>
 #include <string>
 #include <memory>
+#include "Util.hpp"
 #include "HttpServer.hpp"
 
 static void Usage(std::string proc)
@@ -10,7 +11,7 @@ static void Usage(std::string proc)
 
 int main(int argc, char *argv[])
 {
-    if(argc != 2)
+    if (argc != 2)
     {
         Usage(argv[0]);
         exit(5);
@@ -19,6 +20,6 @@ int main(int argc, char *argv[])
     std::shared_ptr<HttpServer> serv(new HttpServer(port));
     serv->InitServer();
     serv->Loop();
-    
+
     return 0;
 }
