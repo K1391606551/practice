@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <cassert>
 #include <cstdarg>
 #include <ctime>
@@ -89,13 +90,49 @@ public:
         fsync(fileno(out)); // 将OS中的数据尽快刷盘
     }
 
-    static void Cutstring(const std::string &target, std::string *key, std::string *value, std::string &sep)
+    static void Cutstring(const std::string &target, std::string *sub1, std::string *sub2, const std::string &sep)
     {
         size_t pos = target.find(sep);
         if(pos != std::string::npos)
         {
-            *key = target.substr(0, pos);
-            *value = target.substr(pos + sep.size());
+            *sub1 = target.substr(0, pos);
+            *sub2 = target.substr(pos + sep.size());
         }
+    }
+
+    static std::string Code2Desc(int code)
+    {
+        std::string desc;
+        switch(code)
+        {
+            case 200:
+                desc = "OK";
+                break;
+            case 404:
+                desc = "Not Found";
+                break;
+            default:
+                break;
+        }
+
+        return desc;
+    }
+
+    static std::string Suffix2Desc(const std::string &suffix)
+    {
+        std::unordered_map<std::string, std::string> suffix2desc = {
+            {".html", "text/html"},
+            {".css", "text/css"},
+            {"js", "application/javascript"},
+            {".jpg", "application/x-jpg"},
+            {".htm", "text/htm"}
+        };
+        
+        auto iter = suffix2desc.find(suffix);
+        if(iter != suffix2desc.end())
+        {
+            return iter->second;
+        }
+        return "text/html";
     }
 };
